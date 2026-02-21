@@ -1,0 +1,35 @@
+{
+  "throttle_ms": 50,
+  "group_tag_format": "tg/{group}",
+  "active_mode_group_name": "active",
+
+  "skip_url_prefixes": [
+    "about:",
+    "file:",
+    "safari-extension:",
+    "chrome-extension:"
+  ],
+  "skip_url_regex": [
+    "^(https?://)?localhost[:/]"
+  ],
+
+  "domain_tags": {
+    "github.com": ["dev"],
+    "bitbucket": ["dev"],
+    "docs.google.com": ["docs"],
+    "stackoverflow.com": ["dev"],
+    "cms.gov": ["cms"],
+    "ncqa.org": ["ncqa"],
+    "arxiv.org": ["papers"],
+    "*.gov": ["gov"],
+    "*.edu": ["edu"]
+  },
+
+  "keyword_tags": [
+    { "pattern": "\\brfc\\b", "fields": ["title", "url"], "tags": ["rfc"] },
+    { "pattern": "\\bchangelog\\b|\\brelease\\b", "fields": ["title"], "tags": ["release-notes"] },
+    { "pattern": "\\bapi\\b|\\bsdk\\b|\\bdocs\\b|\\bdocumentation\\b", "fields": ["title"], "tags": ["docs"] },
+    { "pattern": "\\btutorial\\b|\\bhow.to\\b|\\bguide\\b", "fields": ["title"], "tags": ["tutorial"] },
+    { "pattern": "\\bvideo\\b|youtube\\.com|vimeo\\.com", "fields": ["title", "url"], "tags": ["video"] }
+  ]
+}

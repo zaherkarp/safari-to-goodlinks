@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RULES_FILE="${RULES_FILE:-$REPO_DIR/config/rules.json}"
+
+usage() {
+  cat <<'EOF'
+stg2gl: Save a Safari Tab Group's tabs to GoodLinks with smart tags.
+
+USAGE:
+  stg2gl --group "Group Name" [options]
+
+REQUIRED:
+  --group NAME         Tab Group name (exact or partial match)
+
+OPTIONS:
+  --rules FILE         Tagging rules JSON file (default: config/rules.json)
+  --base-tag TAG       Additional tag added to every saved item (repeatable)
+  --dry-run            Print what would be saved, do not send to GoodLinks
+  --throttle MS        Delay between saves (default from rules.json, fallback 50ms)
+  --dedupe             Skip URLs already saved in this run (default: on)
+  --max N              Only process first N tabs
+  --mode MODE          active | select
+                       active: use current Safari front window tabs (no group selection)
+                       select: select tab group by name first (default)
+  --help               Show help
+
+EXAMPLES:
+  stg2gl --group "Work" --base-tag "inbox" --dry-run
+  stg2gl --group "Stars" --throttle 100
+  stg2gl --mode active --base-tag "quick-harvest"
+
+NOTES:
+- "select" mode uses macOS Accessibility GUI scripting to click the Tab Group in Safari's sidebar.
+- You must grant Accessibility permission to the runner app (Terminal / iTerm / Script Editor).
+EOF
+}
+
+GROUP=""
+DRY_RUN="0"
+THROTTLE=""
+DEDUPE="1"
+MAX=""
+MODE="select"
+BASE_TAGS=()
+RULES_OVERRIDE=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --group) GROUP="${2:-}"; shift 2;;
+    --rules) RULES_OVERRIDE="${2:-}"; shift 2;;
+    --base-tag) BASE_TAGS+=("${2:-}"); shift 2;;
+    --dry-run) DRY_RUN="1"; shift;;
+    --throttle) THROTTLE="${2:-}"; shift 2;;
+    --dedupe) DEDUPE="1"; shift;;
+    --max) MAX="${2:-}"; shift 2;;
+    --mode) MODE="${2:-}"; shift 2;;
+    --help|-h) usage; exit 0;;
+    *) echo "Unknown arg: $1" >&2; usage; exit 1;;
+  esac
+done
+
+if [[ -z "$GROUP" && "$MODE" == "select" ]]; then
+  echo "Error: --group is required in select mode" >&2
+  usage
+  exit 1
+fi
+
+RULES_PATH="${RULES_OVERRIDE:-$RULES_FILE}"
+if [[ ! -f "$RULES_PATH" ]]; then
+  echo "Error: rules file not found: $RULES_PATH" >&2
+  exit 1
+fi
+
+# Read defaults from rules.json
+DEFAULT_THROTTLE="$(python3 -c "
+import json
+cfg=json.load(open('$RULES_PATH'))
+print(cfg.get('throttle_ms', 50))
+")"
+THROTTLE="${THROTTLE:-$DEFAULT_THROTTLE}"
+
+# Mode: optionally select group
+if [[ "$MODE" == "select" ]]; then
+  osascript "$REPO_DIR/scripts/select_tab_group.applescript" "$GROUP"
+fi
+
+# Export tabs JSON to stdout
+TABS_JSON="$(osascript "$REPO_DIR/scripts/export_tabs.applescript")"
+
+# Convert BASE_TAGS array to Python list string
+PYTAGS="["
+for bt in "${BASE_TAGS[@]+"${BASE_TAGS[@]}"}"; do
+  PYTAGS+="\"$bt\","
+done
+PYTAGS+="]"
+
+# Pipe into saver
+python3 - "$RULES_PATH" "$PYTAGS" "$DRY_RUN" "$DEDUPE" "$MAX" "$THROTTLE" "$GROUP" "$MODE" <<'PY'
+import json, re, sys, time, urllib.parse, subprocess
+
+rules_path = sys.argv[1]
+base_tags_str = sys.argv[2]
+dry_run = sys.argv[3] == "1"
+dedupe = sys.argv[4] == "1"
+max_arg = sys.argv[5]
+throttle_ms = int(sys.argv[6])
+group = sys.argv[7]
+mode = sys.argv[8]
+
+max_n = int(max_arg) if max_arg else None
+
+cfg = json.load(open(rules_path))
+tabs = json.loads(sys.stdin.read()) if not sys.stdin.isatty() else json.loads(input())
+
+# Actually read tabs from the environment variable passed via stdin
+import os
+tabs_json_env = os.environ.get("TABS_JSON", "[]")
+
+base_tags = json.loads(base_tags_str.replace("'", '"')) if base_tags_str != "[]" else []
+
+skip_prefixes = tuple(cfg.get("skip_url_prefixes", []))
+skip_regex = [re.compile(p) for p in cfg.get("skip_url_regex", [])]
+
+domain_tags = cfg.get("domain_tags", {})
+keyword_tags = cfg.get("keyword_tags", [])
+group_tag_fmt = cfg.get("group_tag_format", "tg/{group}")
+
+def norm_tag(t):
+    t = t.strip().lower().replace(" ", "-")
+    return t
+
+def should_skip(url):
+    if not url or any(url.startswith(p) for p in skip_prefixes):
+        return True
+    for rx in skip_regex:
+        if rx.search(url):
+            return True
+    return False
+
+def host_of(url):
+    try:
+        return urllib.parse.urlparse(url).netloc.lower()
+    except Exception:
+        return ""
+
+def apply_rules(url, title, group_name):
+    tags = []
+    tags.append(norm_tag(group_tag_fmt.format(group=group_name)))
+    for bt in base_tags:
+        if bt:
+            tags.append(norm_tag(bt))
+
+    host = host_of(url)
+    for k, v in domain_tags.items():
+        if k.lower() in host:
+            tags.extend([norm_tag(x) for x in v])
+
+    title_l = (title or "").lower()
+    url_l = url.lower()
+
+    for rule in keyword_tags:
+        pat = re.compile(rule["pattern"], re.I)
+        fields = rule.get("fields", ["title", "url"])
+        hay = ""
+        if "title" in fields:
+            hay += title_l + " "
+        if "url" in fields:
+            hay += url_l
+        if pat.search(hay):
+            tags.extend([norm_tag(x) for x in rule["tags"]])
+
+    # de-dupe tags
+    out = []
+    seen = set()
+    for t in tags:
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+seen_urls = set()
+count_saved = 0
+count_skipped = 0
+count_total = 0
+
+group_name = group if mode == "select" else cfg.get("active_mode_group_name", "active")
+
+for item in tabs:
+    if max_n is not None and count_total >= max_n:
+        break
+    url = item.get("url", "")
+    title = item.get("title", "")
+    count_total += 1
+
+    if should_skip(url):
+        count_skipped += 1
+        continue
+    if dedupe and url in seen_urls:
+        count_skipped += 1
+        continue
+    seen_urls.add(url)
+
+    tags = apply_rules(url, title, group_name)
+    # build GoodLinks save URL
+    gl = "goodlinks://x-callback-url/save?quick=1&url={u}&tags={t}".format(
+        u=urllib.parse.quote(url, safe=""),
+        t=urllib.parse.quote(" ".join(tags), safe="")
+    )
+
+    if dry_run:
+        print(f"[DRY] {title[:80]!r} -> {url}")
+        print(f"      tags: {' '.join(tags)}")
+    else:
+        subprocess.run(["open", gl], check=False)
+
+    count_saved += 1
+    time.sleep(throttle_ms / 1000.0)
+
+print(f"Done. total={count_total} saved={count_saved} skipped={count_skipped}", file=sys.stderr)
+PY
