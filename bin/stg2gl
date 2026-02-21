@@ -75,10 +75,10 @@ fi
 
 # Read defaults from rules.json
 DEFAULT_THROTTLE="$(python3 -c "
-import json
-cfg=json.load(open('$RULES_PATH'))
+import json, sys
+cfg = json.load(open(sys.argv[1]))
 print(cfg.get('throttle_ms', 50))
-")"
+" "$RULES_PATH")"
 THROTTLE="${THROTTLE:-$DEFAULT_THROTTLE}"
 
 # Mode: optionally select group
@@ -89,47 +89,47 @@ fi
 # Export tabs JSON to stdout
 TABS_JSON="$(osascript "$REPO_DIR/scripts/export_tabs.applescript")"
 
-# Convert BASE_TAGS array to Python list string
-PYTAGS="["
-for bt in "${BASE_TAGS[@]+"${BASE_TAGS[@]}"}"; do
-  PYTAGS+="\"$bt\","
-done
-PYTAGS+="]"
+# Safely serialize BASE_TAGS to JSON via python (avoids shell quoting issues)
+BASE_TAGS_JSON="$(python3 -c "import json, sys; print(json.dumps(sys.argv[1:]))" "${BASE_TAGS[@]+"${BASE_TAGS[@]}"}")"
 
-# Pipe into saver
-python3 - "$RULES_PATH" "$PYTAGS" "$DRY_RUN" "$DEDUPE" "$MAX" "$THROTTLE" "$GROUP" "$MODE" <<'PY'
-import json, re, sys, time, urllib.parse, subprocess
+# Pass data via environment variables so the heredoc stays clean
+export STG2GL_TABS_JSON="$TABS_JSON"
+export STG2GL_BASE_TAGS_JSON="$BASE_TAGS_JSON"
+export STG2GL_RULES_PATH="$RULES_PATH"
+export STG2GL_DRY_RUN="$DRY_RUN"
+export STG2GL_DEDUPE="$DEDUPE"
+export STG2GL_MAX="$MAX"
+export STG2GL_THROTTLE="$THROTTLE"
+export STG2GL_GROUP="$GROUP"
+export STG2GL_MODE="$MODE"
 
-rules_path = sys.argv[1]
-base_tags_str = sys.argv[2]
-dry_run = sys.argv[3] == "1"
-dedupe = sys.argv[4] == "1"
-max_arg = sys.argv[5]
-throttle_ms = int(sys.argv[6])
-group = sys.argv[7]
-mode = sys.argv[8]
+python3 - <<'PY'
+import json, os, re, subprocess, sys, time, urllib.parse
+
+# Read all inputs from environment variables (set by the calling bash script)
+rules_path   = os.environ["STG2GL_RULES_PATH"]
+dry_run      = os.environ["STG2GL_DRY_RUN"] == "1"
+dedupe       = os.environ["STG2GL_DEDUPE"] == "1"
+max_arg      = os.environ["STG2GL_MAX"]
+throttle_ms  = int(os.environ["STG2GL_THROTTLE"])
+group        = os.environ["STG2GL_GROUP"]
+mode         = os.environ["STG2GL_MODE"]
 
 max_n = int(max_arg) if max_arg else None
 
-cfg = json.load(open(rules_path))
-tabs = json.loads(sys.stdin.read()) if not sys.stdin.isatty() else json.loads(input())
-
-# Actually read tabs from the environment variable passed via stdin
-import os
-tabs_json_env = os.environ.get("TABS_JSON", "[]")
-
-base_tags = json.loads(base_tags_str.replace("'", '"')) if base_tags_str != "[]" else []
+cfg  = json.load(open(rules_path))
+tabs = json.loads(os.environ["STG2GL_TABS_JSON"])
+base_tags = json.loads(os.environ["STG2GL_BASE_TAGS_JSON"])
 
 skip_prefixes = tuple(cfg.get("skip_url_prefixes", []))
 skip_regex = [re.compile(p) for p in cfg.get("skip_url_regex", [])]
 
-domain_tags = cfg.get("domain_tags", {})
+domain_tags  = cfg.get("domain_tags", {})
 keyword_tags = cfg.get("keyword_tags", [])
 group_tag_fmt = cfg.get("group_tag_format", "tg/{group}")
 
 def norm_tag(t):
-    t = t.strip().lower().replace(" ", "-")
-    return t
+    return t.strip().lower().replace(" ", "-")
 
 def should_skip(url):
     if not url or any(url.startswith(p) for p in skip_prefixes):
@@ -171,7 +171,7 @@ def apply_rules(url, title, group_name):
         if pat.search(hay):
             tags.extend([norm_tag(x) for x in rule["tags"]])
 
-    # de-dupe tags
+    # de-dupe tags while preserving order
     out = []
     seen = set()
     for t in tags:
@@ -203,10 +203,9 @@ for item in tabs:
     seen_urls.add(url)
 
     tags = apply_rules(url, title, group_name)
-    # build GoodLinks save URL
     gl = "goodlinks://x-callback-url/save?quick=1&url={u}&tags={t}".format(
         u=urllib.parse.quote(url, safe=""),
-        t=urllib.parse.quote(" ".join(tags), safe="")
+        t=urllib.parse.quote(" ".join(tags), safe=""),
     )
 
     if dry_run:

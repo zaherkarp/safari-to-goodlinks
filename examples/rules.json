@@ -21,8 +21,8 @@
     "cms.gov": ["cms"],
     "ncqa.org": ["ncqa"],
     "arxiv.org": ["papers"],
-    "*.gov": ["gov"],
-    "*.edu": ["edu"]
+    ".gov": ["gov"],
+    ".edu": ["edu"]
   },
 
   "keyword_tags": [
