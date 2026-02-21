@@ -1,0 +1,398 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RULES_FILE="${RULES_FILE:-$REPO_DIR/config/rules.json}"
+
+usage() {
+  cat <<'EOF'
+stg2gl: Save a Safari Tab Group's tabs to GoodLinks or local storage with smart tags.
+
+USAGE:
+  stg2gl --group "Group Name" [options]
+
+REQUIRED:
+  --group NAME         Tab Group name (exact or partial match)
+
+OPTIONS:
+  --rules FILE         Tagging rules JSON file (default: config/rules.json)
+  --base-tag TAG       Additional tag added to every saved item (repeatable)
+  --dry-run            Print what would be saved, do not save anywhere
+  --throttle MS        Delay between saves (default from rules.json, fallback 50ms)
+  --dedupe             Skip URLs already saved in this run (default: on)
+  --max N              Only process first N tabs
+  --mode MODE          active | select
+                       active: use current Safari front window tabs (no group selection)
+                       select: select tab group by name first (default)
+  --output TARGET      goodlinks | json | sqlite | markdown
+                       goodlinks: save via GoodLinks URL scheme (syncs to iCloud)
+                       json:      append to local JSON file (no cloud)
+                       sqlite:    insert into local SQLite database (no cloud)
+                       markdown:  append to local Markdown file (no cloud)
+                       (default: goodlinks)
+  --output-file PATH   File path for json/sqlite/markdown output
+                       (default: ./stg2gl_bookmarks.{json,db,md})
+  --help               Show help
+
+EXAMPLES:
+  stg2gl --group "Work" --base-tag "inbox" --dry-run
+  stg2gl --group "Stars" --output json
+  stg2gl --group "Work" --output sqlite --output-file ~/bookmarks.db
+  stg2gl --mode active --output markdown --base-tag "quick-harvest"
+
+NOTES:
+- "select" mode uses macOS Accessibility GUI scripting to click the Tab Group in Safari's sidebar.
+- You must grant Accessibility permission to the runner app (Terminal / iTerm / Script Editor).
+- Local output modes (json, sqlite, markdown) never touch GoodLinks or iCloud.
+EOF
+}
+
+GROUP=""
+DRY_RUN="0"
+THROTTLE=""
+DEDUPE="1"
+MAX=""
+MODE="select"
+BASE_TAGS=()
+RULES_OVERRIDE=""
+OUTPUT="goodlinks"
+OUTPUT_FILE=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --group) GROUP="${2:-}"; shift 2;;
+    --rules) RULES_OVERRIDE="${2:-}"; shift 2;;
+    --base-tag) BASE_TAGS+=("${2:-}"); shift 2;;
+    --dry-run) DRY_RUN="1"; shift;;
+    --throttle) THROTTLE="${2:-}"; shift 2;;
+    --dedupe) DEDUPE="1"; shift;;
+    --max) MAX="${2:-}"; shift 2;;
+    --mode) MODE="${2:-}"; shift 2;;
+    --output) OUTPUT="${2:-}"; shift 2;;
+    --output-file) OUTPUT_FILE="${2:-}"; shift 2;;
+    --help|-h) usage; exit 0;;
+    *) echo "Unknown arg: $1" >&2; usage; exit 1;;
+  esac
+done
+
+if [[ -z "$GROUP" && "$MODE" == "select" ]]; then
+  echo "Error: --group is required in select mode" >&2
+  usage
+  exit 1
+fi
+
+# Validate --output
+case "$OUTPUT" in
+  goodlinks|json|sqlite|markdown) ;;
+  *) echo "Error: --output must be one of: goodlinks, json, sqlite, markdown" >&2; exit 1;;
+esac
+
+# Set default output file based on output type
+if [[ -z "$OUTPUT_FILE" ]]; then
+  case "$OUTPUT" in
+    json)     OUTPUT_FILE="./stg2gl_bookmarks.json";;
+    sqlite)   OUTPUT_FILE="./stg2gl_bookmarks.db";;
+    markdown) OUTPUT_FILE="./stg2gl_bookmarks.md";;
+    goodlinks) OUTPUT_FILE="";;  # not used
+  esac
+fi
+
+RULES_PATH="${RULES_OVERRIDE:-$RULES_FILE}"
+if [[ ! -f "$RULES_PATH" ]]; then
+  echo "Error: rules file not found: $RULES_PATH" >&2
+  exit 1
+fi
+
+# Validate --throttle (must be a non-negative integer, max 10000)
+if [[ -n "$THROTTLE" ]]; then
+  if ! [[ "$THROTTLE" =~ ^[0-9]+$ ]] || [[ "$THROTTLE" -gt 10000 ]]; then
+    echo "Error: --throttle must be an integer between 0 and 10000" >&2
+    exit 1
+  fi
+fi
+
+# Validate --max (must be a positive integer)
+if [[ -n "$MAX" ]]; then
+  if ! [[ "$MAX" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: --max must be a positive integer" >&2
+    exit 1
+  fi
+fi
+
+# Read defaults from rules.json
+DEFAULT_THROTTLE="$(python3 -c "
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+print(cfg.get('throttle_ms', 50))
+" "$RULES_PATH")"
+THROTTLE="${THROTTLE:-$DEFAULT_THROTTLE}"
+
+# Mode: optionally select group
+if [[ "$MODE" == "select" ]]; then
+  osascript "$REPO_DIR/scripts/select_tab_group.applescript" "$GROUP"
+fi
+
+# Export tabs JSON to stdout
+TABS_JSON="$(osascript "$REPO_DIR/scripts/export_tabs.applescript")"
+
+# Safely serialize BASE_TAGS to JSON via python (avoids shell quoting issues)
+BASE_TAGS_JSON="$(python3 -c "import json, sys; print(json.dumps(sys.argv[1:]))" "${BASE_TAGS[@]+"${BASE_TAGS[@]}"}")"
+
+# Pass data via environment variables scoped ONLY to the python3 process.
+# Using inline assignment (VAR=val command) ensures the variables are NOT
+# exported to any other child process and do not persist after python3 exits.
+# This is important because STG2GL_TABS_JSON contains the user's browsing
+# history (all tab URLs and page titles).
+STG2GL_TABS_JSON="$TABS_JSON" \
+STG2GL_BASE_TAGS_JSON="$BASE_TAGS_JSON" \
+STG2GL_RULES_PATH="$RULES_PATH" \
+STG2GL_DRY_RUN="$DRY_RUN" \
+STG2GL_DEDUPE="$DEDUPE" \
+STG2GL_MAX="$MAX" \
+STG2GL_THROTTLE="$THROTTLE" \
+STG2GL_GROUP="$GROUP" \
+STG2GL_MODE="$MODE" \
+STG2GL_OUTPUT="$OUTPUT" \
+STG2GL_OUTPUT_FILE="$OUTPUT_FILE" \
+python3 - <<'PY'
+import json, os, re, subprocess, sys, time, urllib.parse
+from datetime import datetime, timezone
+
+# Read all inputs from environment variables (set by the calling bash script)
+rules_path   = os.environ["STG2GL_RULES_PATH"]
+dry_run      = os.environ["STG2GL_DRY_RUN"] == "1"
+dedupe       = os.environ["STG2GL_DEDUPE"] == "1"
+max_arg      = os.environ["STG2GL_MAX"]
+throttle_ms  = int(os.environ["STG2GL_THROTTLE"])
+group        = os.environ["STG2GL_GROUP"]
+mode         = os.environ["STG2GL_MODE"]
+output       = os.environ["STG2GL_OUTPUT"]
+output_file  = os.environ.get("STG2GL_OUTPUT_FILE", "")
+
+max_n = int(max_arg) if max_arg else None
+
+cfg  = json.load(open(rules_path))
+tabs = json.loads(os.environ["STG2GL_TABS_JSON"])
+base_tags = json.loads(os.environ["STG2GL_BASE_TAGS_JSON"])
+
+skip_prefixes = tuple(cfg.get("skip_url_prefixes", []))
+
+# Validate and compile skip regexes (reject invalid patterns early)
+skip_regex = []
+for p in cfg.get("skip_url_regex", []):
+    try:
+        skip_regex.append(re.compile(p))
+    except re.error as e:
+        print(f"Warning: invalid skip_url_regex pattern {p!r}: {e}", file=sys.stderr)
+
+domain_tags  = cfg.get("domain_tags", {})
+keyword_tags = cfg.get("keyword_tags", [])
+
+# Use simple string replacement instead of str.format() to prevent
+# format string injection (e.g. {group.__class__} in a malicious rules.json)
+group_tag_template = cfg.get("group_tag_format", "tg/{group}")
+
+# Pre-compile and validate keyword_tags regexes
+compiled_keyword_tags = []
+for rule in keyword_tags:
+    try:
+        pat = re.compile(rule["pattern"], re.I)
+        compiled_keyword_tags.append((pat, rule))
+    except re.error as e:
+        print(f"Warning: invalid keyword_tags pattern {rule.get('pattern', '?')!r}: {e}", file=sys.stderr)
+
+def norm_tag(t):
+    return t.strip().lower().replace(" ", "-")
+
+def should_skip(url):
+    if not url or any(url.startswith(p) for p in skip_prefixes):
+        return True
+    for rx in skip_regex:
+        if rx.search(url):
+            return True
+    return False
+
+def host_of(url):
+    try:
+        return urllib.parse.urlparse(url).netloc.lower()
+    except Exception:
+        return ""
+
+def apply_rules(url, title, group_name):
+    tags = []
+    # Safe string replacement — no Python format string interpretation
+    tags.append(norm_tag(group_tag_template.replace("{group}", group_name)))
+    for bt in base_tags:
+        if bt:
+            tags.append(norm_tag(bt))
+
+    host = host_of(url)
+    for k, v in domain_tags.items():
+        if k.lower() in host:
+            tags.extend([norm_tag(x) for x in v])
+
+    title_l = (title or "").lower()
+    url_l = url.lower()
+
+    for pat, rule in compiled_keyword_tags:
+        fields = rule.get("fields", ["title", "url"])
+        hay = ""
+        if "title" in fields:
+            hay += title_l + " "
+        if "url" in fields:
+            hay += url_l
+        if pat.search(hay):
+            tags.extend([norm_tag(x) for x in rule["tags"]])
+
+    # de-dupe tags while preserving order
+    out = []
+    seen = set()
+    for t in tags:
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Output backends
+# ---------------------------------------------------------------------------
+
+def save_goodlinks(url, title, tags):
+    """Save via GoodLinks URL scheme (triggers iCloud sync)."""
+    gl = "goodlinks://x-callback-url/save?quick=1&url={u}&tags={t}".format(
+        u=urllib.parse.quote(url, safe=""),
+        t=urllib.parse.quote(" ".join(tags), safe=""),
+    )
+    subprocess.run(["open", gl], check=False)
+    time.sleep(throttle_ms / 1000.0)
+
+def save_json(url, title, tags, items_buffer):
+    """Collect items into buffer; written to disk at end."""
+    items_buffer.append({
+        "url": url,
+        "title": title,
+        "tags": tags,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+def flush_json(items_buffer, path):
+    """Append new items to a JSON file (array of objects)."""
+    existing = []
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                existing = json.load(f)
+        except (json.JSONDecodeError, ValueError):
+            print(f"Warning: {path} exists but is not valid JSON, overwriting", file=sys.stderr)
+    existing.extend(items_buffer)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(existing, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, path)
+    print(f"Wrote {len(items_buffer)} items to {path} ({len(existing)} total)", file=sys.stderr)
+
+def save_sqlite(url, title, tags, db_conn):
+    """Insert one row into the SQLite bookmarks table."""
+    db_conn.execute(
+        "INSERT OR IGNORE INTO bookmarks (url, title, tags, saved_at) VALUES (?, ?, ?, ?)",
+        (url, title, " ".join(tags), datetime.now(timezone.utc).isoformat()),
+    )
+
+def init_sqlite(path):
+    """Open (or create) the SQLite database and return a connection."""
+    import sqlite3
+    conn = sqlite3.connect(path)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bookmarks (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            url       TEXT UNIQUE NOT NULL,
+            title     TEXT,
+            tags      TEXT,
+            saved_at  TEXT
+        )
+    """)
+    return conn
+
+def flush_sqlite(db_conn, path, count):
+    """Commit and close the SQLite connection."""
+    db_conn.commit()
+    db_conn.close()
+    print(f"Wrote {count} items to {path}", file=sys.stderr)
+
+def save_markdown(url, title, tags, md_lines):
+    """Collect Markdown lines into buffer; written to disk at end."""
+    tag_str = " ".join(f"`{t}`" for t in tags)
+    md_lines.append(f"- [{title}]({url}) {tag_str}")
+
+def flush_markdown(md_lines, path, group_name):
+    """Append a dated section to a Markdown file."""
+    date = datetime.now().strftime("%Y-%m-%d %H:%M")
+    section = f"\n## {date} — {group_name}\n\n" + "\n".join(md_lines) + "\n"
+    with open(path, "a") as f:
+        f.write(section)
+    print(f"Appended {len(md_lines)} items to {path}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+seen_urls = set()
+count_saved = 0
+count_skipped = 0
+count_total = 0
+
+group_name = group if mode == "select" else cfg.get("active_mode_group_name", "active")
+
+# Initialize output backend state
+json_buffer = []
+md_buffer = []
+db_conn = None
+if output == "sqlite" and not dry_run:
+    db_conn = init_sqlite(output_file)
+
+for item in tabs:
+    if max_n is not None and count_total >= max_n:
+        break
+    url = item.get("url", "")
+    title = item.get("title", "")
+    count_total += 1
+
+    if should_skip(url):
+        count_skipped += 1
+        continue
+    if dedupe and url in seen_urls:
+        count_skipped += 1
+        continue
+    seen_urls.add(url)
+
+    tags = apply_rules(url, title, group_name)
+
+    if dry_run:
+        print(f"[DRY] {title[:80]!r} -> {url}")
+        print(f"      tags: {' '.join(tags)}")
+    else:
+        if output == "goodlinks":
+            save_goodlinks(url, title, tags)
+        elif output == "json":
+            save_json(url, title, tags, json_buffer)
+        elif output == "sqlite":
+            save_sqlite(url, title, tags, db_conn)
+        elif output == "markdown":
+            save_markdown(url, title, tags, md_buffer)
+
+    count_saved += 1
+
+# Flush local output backends
+if not dry_run:
+    if output == "json" and json_buffer:
+        flush_json(json_buffer, output_file)
+    elif output == "sqlite" and db_conn:
+        flush_sqlite(db_conn, output_file, count_saved)
+    elif output == "markdown" and md_buffer:
+        flush_markdown(md_buffer, output_file, group_name)
+
+print(f"Done. total={count_total} saved={count_saved} skipped={count_skipped}", file=sys.stderr)
+PY
