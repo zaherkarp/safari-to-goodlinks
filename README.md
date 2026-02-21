@@ -268,6 +268,35 @@ chmod +x bin/stg2gl
 
 Re-enable in System Settings -> Privacy & Security. You may need to remove and re-add Terminal from the Accessibility list if permissions get stuck.
 
+## Privacy considerations
+
+This tool reads your browser tabs and sends each URL to GoodLinks. Be aware of the following:
+
+**URLs are sent to GoodLinks, which syncs via iCloud.** Every URL saved by this tool is stored in GoodLinks and uploaded to Apple's iCloud servers. If your tabs contain sensitive URLs — internal company tools, admin panels, healthcare portals, financial dashboards, or URLs with authentication tokens in query strings — those URLs will be synced to iCloud.
+
+**Use `--dry-run` first** to review exactly which URLs will be saved before committing. This is especially important if your Tab Group contains a mix of public and private pages.
+
+**Sensitive URL filtering.** The `skip_url_prefixes` and `skip_url_regex` fields in `rules.json` let you automatically skip URLs matching patterns you define. Consider adding patterns for internal domains:
+
+```json
+{
+  "skip_url_prefixes": [
+    "about:",
+    "file:",
+    "https://internal.company.com",
+    "https://admin."
+  ],
+  "skip_url_regex": [
+    "^(https?://)?localhost[:/]",
+    "[?&](token|key|secret|password|auth)="
+  ]
+}
+```
+
+**No data leaves your machine** except through GoodLinks' own iCloud sync. The tool itself makes no network calls — all processing is local.
+
+**`--dry-run` output goes to stdout.** If your terminal session is being logged or recorded, the dry-run output (which includes all tab URLs and titles) will appear in those logs.
+
 ## Notes
 
 - Safari Tab Groups are **not directly scriptable** in AppleScript. This tool uses macOS Accessibility GUI scripting to click the matching group in Safari's sidebar. This means `--mode select` requires Accessibility permission and may break if Apple changes Safari's sidebar UI in a future macOS update.

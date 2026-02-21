@@ -73,6 +73,22 @@ if [[ ! -f "$RULES_PATH" ]]; then
   exit 1
 fi
 
+# Validate --throttle (must be a non-negative integer, max 10000)
+if [[ -n "$THROTTLE" ]]; then
+  if ! [[ "$THROTTLE" =~ ^[0-9]+$ ]] || [[ "$THROTTLE" -gt 10000 ]]; then
+    echo "Error: --throttle must be an integer between 0 and 10000" >&2
+    exit 1
+  fi
+fi
+
+# Validate --max (must be a positive integer)
+if [[ -n "$MAX" ]]; then
+  if ! [[ "$MAX" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: --max must be a positive integer" >&2
+    exit 1
+  fi
+fi
+
 # Read defaults from rules.json
 DEFAULT_THROTTLE="$(python3 -c "
 import json, sys
@@ -92,17 +108,20 @@ TABS_JSON="$(osascript "$REPO_DIR/scripts/export_tabs.applescript")"
 # Safely serialize BASE_TAGS to JSON via python (avoids shell quoting issues)
 BASE_TAGS_JSON="$(python3 -c "import json, sys; print(json.dumps(sys.argv[1:]))" "${BASE_TAGS[@]+"${BASE_TAGS[@]}"}")"
 
-# Pass data via environment variables so the heredoc stays clean
-export STG2GL_TABS_JSON="$TABS_JSON"
-export STG2GL_BASE_TAGS_JSON="$BASE_TAGS_JSON"
-export STG2GL_RULES_PATH="$RULES_PATH"
-export STG2GL_DRY_RUN="$DRY_RUN"
-export STG2GL_DEDUPE="$DEDUPE"
-export STG2GL_MAX="$MAX"
-export STG2GL_THROTTLE="$THROTTLE"
-export STG2GL_GROUP="$GROUP"
-export STG2GL_MODE="$MODE"
-
+# Pass data via environment variables scoped ONLY to the python3 process.
+# Using inline assignment (VAR=val command) ensures the variables are NOT
+# exported to any other child process and do not persist after python3 exits.
+# This is important because STG2GL_TABS_JSON contains the user's browsing
+# history (all tab URLs and page titles).
+STG2GL_TABS_JSON="$TABS_JSON" \
+STG2GL_BASE_TAGS_JSON="$BASE_TAGS_JSON" \
+STG2GL_RULES_PATH="$RULES_PATH" \
+STG2GL_DRY_RUN="$DRY_RUN" \
+STG2GL_DEDUPE="$DEDUPE" \
+STG2GL_MAX="$MAX" \
+STG2GL_THROTTLE="$THROTTLE" \
+STG2GL_GROUP="$GROUP" \
+STG2GL_MODE="$MODE" \
 python3 - <<'PY'
 import json, os, re, subprocess, sys, time, urllib.parse
 
@@ -122,11 +141,30 @@ tabs = json.loads(os.environ["STG2GL_TABS_JSON"])
 base_tags = json.loads(os.environ["STG2GL_BASE_TAGS_JSON"])
 
 skip_prefixes = tuple(cfg.get("skip_url_prefixes", []))
-skip_regex = [re.compile(p) for p in cfg.get("skip_url_regex", [])]
+
+# Validate and compile skip regexes (reject invalid patterns early)
+skip_regex = []
+for p in cfg.get("skip_url_regex", []):
+    try:
+        skip_regex.append(re.compile(p))
+    except re.error as e:
+        print(f"Warning: invalid skip_url_regex pattern {p!r}: {e}", file=sys.stderr)
 
 domain_tags  = cfg.get("domain_tags", {})
 keyword_tags = cfg.get("keyword_tags", [])
-group_tag_fmt = cfg.get("group_tag_format", "tg/{group}")
+
+# Use simple string replacement instead of str.format() to prevent
+# format string injection (e.g. {group.__class__} in a malicious rules.json)
+group_tag_template = cfg.get("group_tag_format", "tg/{group}")
+
+# Pre-compile and validate keyword_tags regexes
+compiled_keyword_tags = []
+for rule in keyword_tags:
+    try:
+        pat = re.compile(rule["pattern"], re.I)
+        compiled_keyword_tags.append((pat, rule))
+    except re.error as e:
+        print(f"Warning: invalid keyword_tags pattern {rule.get('pattern', '?')!r}: {e}", file=sys.stderr)
 
 def norm_tag(t):
     return t.strip().lower().replace(" ", "-")
@@ -147,7 +185,8 @@ def host_of(url):
 
 def apply_rules(url, title, group_name):
     tags = []
-    tags.append(norm_tag(group_tag_fmt.format(group=group_name)))
+    # Safe string replacement — no Python format string interpretation
+    tags.append(norm_tag(group_tag_template.replace("{group}", group_name)))
     for bt in base_tags:
         if bt:
             tags.append(norm_tag(bt))
@@ -160,8 +199,7 @@ def apply_rules(url, title, group_name):
     title_l = (title or "").lower()
     url_l = url.lower()
 
-    for rule in keyword_tags:
-        pat = re.compile(rule["pattern"], re.I)
+    for pat, rule in compiled_keyword_tags:
         fields = rule.get("fields", ["title", "url"])
         hay = ""
         if "title" in fields:
