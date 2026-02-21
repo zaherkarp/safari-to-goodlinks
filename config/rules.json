@@ -7,7 +7,13 @@
     "about:",
     "file:",
     "safari-extension:",
-    "chrome-extension:"
+    "chrome-extension:",
+    "javascript:",
+    "data:",
+    "mailto:",
+    "tel:",
+    "sms:",
+    "facetime:"
   ],
   "skip_url_regex": [
     "^(https?://)?localhost[:/]"

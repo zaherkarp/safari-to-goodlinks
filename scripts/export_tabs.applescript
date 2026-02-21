@@ -11,18 +11,20 @@ on run
 		if tabCount is 0 then return "[]"
 
 		-- Collect tab data as paired lines: title\nurl\ntitle\nurl\n...
-		-- SECURITY: Strip newlines and carriage returns from titles to prevent
-		-- injection attacks. A malicious page could set its <title> to include
-		-- a newline, which would break the line-pairing and allow injecting
-		-- arbitrary URLs into the output.
 		set lines_ to {}
 		repeat with t in (tabs of w)
 			set rawTitle to (name of t)
-			-- Replace newlines and carriage returns with spaces
+			set rawURL to (URL of t)
+			-- SECURITY: Strip newlines and carriage returns from BOTH titles and URLs.
+			-- Titles: a malicious page can set <title> to include newlines.
+			-- URLs: data: URIs or edge cases could contain embedded newlines.
+			-- Either would break the line-pairing and allow injection of arbitrary URLs.
 			set sanitizedTitle to my replaceChars(rawTitle, linefeed, " ")
 			set sanitizedTitle to my replaceChars(sanitizedTitle, return, " ")
+			set sanitizedURL to my replaceChars(rawURL, linefeed, "")
+			set sanitizedURL to my replaceChars(sanitizedURL, return, "")
 			set end of lines_ to sanitizedTitle
-			set end of lines_ to (URL of t)
+			set end of lines_ to sanitizedURL
 		end repeat
 	end tell
 

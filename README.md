@@ -171,11 +171,16 @@ All tagging is deterministic — no AI, no network lookups. Rules are applied in
   // Group name used when --mode active (no real group name available)
   "active_mode_group_name": "active",
 
-  // URLs starting with any of these prefixes are silently skipped
+  // URLs starting with any of these prefixes are silently skipped.
+  // Includes non-HTTP schemes that are never useful as bookmarks.
   "skip_url_prefixes": [
     "about:",
     "file:",
-    "safari-extension:"
+    "safari-extension:",
+    "javascript:",
+    "data:",
+    "mailto:",
+    "tel:"
   ],
 
   // URLs matching any of these regexes are silently skipped
@@ -268,34 +273,61 @@ chmod +x bin/stg2gl
 
 Re-enable in System Settings -> Privacy & Security. You may need to remove and re-add Terminal from the Accessibility list if permissions get stuck.
 
-## Privacy considerations
+## Privacy and security considerations
 
-This tool reads your browser tabs and sends each URL to GoodLinks. Be aware of the following:
+This tool reads your browser tabs and sends each URL to GoodLinks. Understand the following before running it.
 
-**URLs are sent to GoodLinks, which syncs via iCloud.** Every URL saved by this tool is stored in GoodLinks and uploaded to Apple's iCloud servers. If your tabs contain sensitive URLs — internal company tools, admin panels, healthcare portals, financial dashboards, or URLs with authentication tokens in query strings — those URLs will be synced to iCloud.
+### Accessibility permission is broad
 
-**Use `--dry-run` first** to review exactly which URLs will be saved before committing. This is especially important if your Tab Group contains a mix of public and private pages.
+In `--mode select`, the tool requires **macOS Accessibility permission for your Terminal app**. This permission allows the Terminal to control the UI of **any application on your Mac** — not just Safari. It persists after the script exits. Any other script or command you run from the same Terminal also inherits this power.
 
-**Sensitive URL filtering.** The `skip_url_prefixes` and `skip_url_regex` fields in `rules.json` let you automatically skip URLs matching patterns you define. Consider adding patterns for internal domains:
+- Only grant Accessibility to terminal apps you trust.
+- Review the scripts in `scripts/` before running to confirm they only interact with Safari.
+- If you only need `--mode active`, you do **not** need Accessibility permission at all.
+
+### URLs are synced to iCloud via GoodLinks
+
+Every URL saved by this tool is stored in GoodLinks and **uploaded to Apple's iCloud servers**. If your tabs contain sensitive URLs — internal company tools, admin panels, healthcare portals, financial dashboards, or URLs with authentication tokens in query strings — those URLs will be synced to the cloud.
+
+### There is no undo
+
+Saved items go to GoodLinks immediately. There is no batch undo — you would need to delete them one by one inside GoodLinks. **Always `--dry-run` first**, especially on large Tab Groups:
+
+```bash
+# Review what would be saved
+./bin/stg2gl --group "Research" --dry-run
+
+# Then save for real only after reviewing
+./bin/stg2gl --group "Research"
+```
+
+### Group name matching is partial
+
+`--group "work"` matches the **first** sidebar element containing "work" (case-insensitive). If you have groups named "Work" and "Homework", it may match either one depending on sidebar order. Use the most specific name you can, or use `--dry-run` to verify.
+
+### Sensitive URL filtering
+
+The `skip_url_prefixes` and `skip_url_regex` fields in `rules.json` control which URLs are silently dropped. The defaults block non-HTTP schemes (`javascript:`, `data:`, `mailto:`, `tel:`, etc.) and localhost URLs. Add patterns for your own internal domains:
 
 ```json
 {
   "skip_url_prefixes": [
-    "about:",
-    "file:",
     "https://internal.company.com",
     "https://admin."
   ],
   "skip_url_regex": [
-    "^(https?://)?localhost[:/]",
     "[?&](token|key|secret|password|auth)="
   ]
 }
 ```
 
-**No data leaves your machine** except through GoodLinks' own iCloud sync. The tool itself makes no network calls — all processing is local.
+### No data leaves your machine (except through GoodLinks)
 
-**`--dry-run` output goes to stdout.** If your terminal session is being logged or recorded, the dry-run output (which includes all tab URLs and titles) will appear in those logs.
+The tool itself makes no network calls — all processing is local. The only external data flow is through GoodLinks' own iCloud sync.
+
+### `--dry-run` output contains browsing history
+
+If your terminal session is logged or recorded (e.g. iTerm2 session logs, `script` command, screen recording), the dry-run output — which includes all tab URLs and titles — will appear in those logs.
 
 ## Notes
 
