@@ -1,6 +1,6 @@
-# Safari Tab Group -> GoodLinks (CLI)
+# Safari Tab Group -> GoodLinks / Local Storage (CLI)
 
-Save every tab in a Safari Tab Group to [GoodLinks](https://goodlinks.app) — each bookmark automatically tagged based on deterministic rules you control.
+Save every tab in a Safari Tab Group — with smart auto-tagging — to [GoodLinks](https://goodlinks.app) or to a **local file** (JSON, SQLite, Markdown) that never touches the cloud.
 
 No AI, no network calls, no dependencies beyond macOS + Python 3 (pre-installed on macOS).
 
@@ -19,7 +19,12 @@ Safari Tab Group
 [stg2gl tagging engine]         <- applies rules from config/rules.json
        |
        v
-  goodlinks://x-callback-url/save?...   <- opens one GoodLinks save URL per tab
+   --output ?
+       |
+       ├── goodlinks  ->  goodlinks://x-callback-url/save  (syncs to iCloud)
+       ├── json       ->  local .json file                  (no cloud)
+       ├── sqlite     ->  local .db file                    (no cloud)
+       └── markdown   ->  local .md file                    (no cloud)
 ```
 
 ## Requirements
@@ -28,8 +33,8 @@ Safari Tab Group
 |---|---|
 | macOS | AppleScript + Accessibility APIs are macOS-only |
 | Safari | The scripts control Safari directly |
-| [GoodLinks](https://goodlinks.app) | Receives bookmarks via its `goodlinks://` URL scheme |
 | Python 3 | Pre-installed on macOS since Catalina. Used for JSON handling and tagging logic |
+| [GoodLinks](https://goodlinks.app) | Only needed if using `--output goodlinks` (the default) |
 
 ## Setup
 
@@ -72,17 +77,64 @@ chmod +x bin/stg2gl
 
 ## Usage
 
-### Save a Tab Group by name
+### Save to GoodLinks (default, syncs to iCloud)
 
 ```bash
 ./bin/stg2gl --group "Work"
 ```
 
-This will:
-1. Open Safari and click the "Work" Tab Group in the sidebar
-2. Read every tab's title and URL
-3. Apply tagging rules from `config/rules.json`
-4. Open a `goodlinks://` save URL for each tab (GoodLinks saves it instantly)
+### Save to a local JSON file (no cloud)
+
+```bash
+./bin/stg2gl --group "Work" --output json
+```
+
+Creates `./stg2gl_bookmarks.json`. New runs append to the same file. Each item:
+
+```json
+{
+  "url": "https://github.com/myorg/myrepo",
+  "title": "GitHub - myorg/myrepo",
+  "tags": ["tg/work", "dev"],
+  "saved_at": "2026-02-21T17:30:00+00:00"
+}
+```
+
+### Save to a local SQLite database (no cloud)
+
+```bash
+./bin/stg2gl --group "Work" --output sqlite
+```
+
+Creates `./stg2gl_bookmarks.db` with a `bookmarks` table. Duplicate URLs are silently skipped (UNIQUE constraint). Query it with any SQLite tool:
+
+```bash
+sqlite3 stg2gl_bookmarks.db "SELECT title, tags FROM bookmarks WHERE tags LIKE '%dev%'"
+```
+
+### Save to a local Markdown file (no cloud)
+
+```bash
+./bin/stg2gl --group "Work" --output markdown
+```
+
+Appends a dated section to `./stg2gl_bookmarks.md`:
+
+```markdown
+## 2026-02-21 17:30 — Work
+
+- [GitHub - myorg/myrepo](https://github.com/myorg/myrepo) `tg/work` `dev`
+- [RFC 9110: HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110) `tg/work` `rfc` `docs`
+```
+
+Works with Obsidian, any text editor, or version control.
+
+### Custom output file path
+
+```bash
+./bin/stg2gl --group "Work" --output sqlite --output-file ~/bookmarks.db
+./bin/stg2gl --group "Work" --output json --output-file ~/Desktop/tabs.json
+```
 
 ### Preview before saving (dry run)
 
@@ -114,18 +166,18 @@ Done. total=3 saved=3 skipped=0
 ### Use current window tabs (skip Tab Group selection)
 
 ```bash
-./bin/stg2gl --mode active --base-tag "quick-harvest"
+./bin/stg2gl --mode active --output json --base-tag "quick-harvest"
 ```
 
 In `active` mode, `--group` is not required. The script reads whatever tabs are in Safari's front window right now.
 
-### Slow down for large batches
+### Slow down for large GoodLinks batches
 
 ```bash
 ./bin/stg2gl --group "Research" --throttle 200
 ```
 
-`--throttle` sets the delay in milliseconds between each save. Default is 50ms (from `rules.json`). Increase if GoodLinks drops items on very large batches.
+`--throttle` sets the delay in milliseconds between each GoodLinks save. Default is 50ms (from `rules.json`). Increase if GoodLinks drops items. Not needed for local output modes.
 
 ### Limit tab count (for testing)
 
@@ -139,10 +191,12 @@ In `active` mode, `--group` is not required. The script reads whatever tabs are 
 |---|---|---|---|
 | `--group "Name"` | Yes (in `select` mode) | — | Tab Group name. Partial match, case-insensitive |
 | `--mode select\|active` | No | `select` | `select`: click group in sidebar first. `active`: use current front window as-is |
+| `--output target` | No | `goodlinks` | Where to save: `goodlinks`, `json`, `sqlite`, or `markdown` |
+| `--output-file path` | No | auto | File path for local output (default: `./stg2gl_bookmarks.{json,db,md}`) |
 | `--rules path/to/file.json` | No | `config/rules.json` | Path to a tagging rules file |
 | `--base-tag tag` | No | — | Extra tag added to every item. Repeatable |
-| `--dry-run` | No | off | Print what would be saved; do not open GoodLinks URLs |
-| `--throttle ms` | No | from `rules.json` (50) | Milliseconds to wait between each save |
+| `--dry-run` | No | off | Print what would be saved; do not save anywhere |
+| `--throttle ms` | No | from `rules.json` (50) | Milliseconds to wait between each GoodLinks save |
 | `--dedupe` | No | on | Skip duplicate URLs within the same run |
 | `--max N` | No | — | Only process the first N tabs |
 
@@ -152,6 +206,20 @@ You can also set a default rules file path via the `RULES_FILE` environment vari
 export RULES_FILE=~/my-custom-rules.json
 ./bin/stg2gl --group "Work"
 ```
+
+## Output modes compared
+
+| | `goodlinks` | `json` | `sqlite` | `markdown` |
+|---|---|---|---|---|
+| **Cloud sync** | iCloud (via GoodLinks) | None | None | None |
+| **Data stays on disk** | No | Yes | Yes | Yes |
+| **Needs GoodLinks installed** | Yes | No | No | No |
+| **Queryable** | In GoodLinks app | `jq`, Python | SQL (`sqlite3`) | Text search |
+| **Dedup across runs** | GoodLinks handles it | Manual | Automatic (UNIQUE) | Manual |
+| **Importable to** | — | GoodLinks, buku, Raindrop | Any SQLite tool | Obsidian, nb |
+| **Human-readable** | Via app | With `jq` | With `sqlite3` | Directly |
+
+**Recommendation:** Use `--output json` or `--output sqlite` if you want your bookmarks to stay entirely local. You can always import the JSON into GoodLinks later if you decide to.
 
 ## Tagging rules (`config/rules.json`)
 
@@ -275,7 +343,15 @@ Re-enable in System Settings -> Privacy & Security. You may need to remove and r
 
 ## Privacy and security considerations
 
-This tool reads your browser tabs and sends each URL to GoodLinks. Understand the following before running it.
+This tool reads your browser tabs and saves them. Where that data ends up depends on which `--output` mode you use.
+
+### Choose your output mode based on sensitivity
+
+| Concern | Use this |
+|---|---|
+| Tabs contain sensitive/internal URLs | `--output json` or `--output sqlite` (local only) |
+| You want iCloud sync across devices | `--output goodlinks` (default) |
+| You want to review before saving anywhere | `--dry-run` first, always |
 
 ### Accessibility permission is broad
 
@@ -285,11 +361,13 @@ In `--mode select`, the tool requires **macOS Accessibility permission for your 
 - Review the scripts in `scripts/` before running to confirm they only interact with Safari.
 - If you only need `--mode active`, you do **not** need Accessibility permission at all.
 
-### URLs are synced to iCloud via GoodLinks
+### `--output goodlinks`: URLs are synced to iCloud
 
-Every URL saved by this tool is stored in GoodLinks and **uploaded to Apple's iCloud servers**. If your tabs contain sensitive URLs — internal company tools, admin panels, healthcare portals, financial dashboards, or URLs with authentication tokens in query strings — those URLs will be synced to the cloud.
+Every URL saved via GoodLinks is stored in GoodLinks and **uploaded to Apple's iCloud servers**. If your tabs contain sensitive URLs — internal company tools, admin panels, healthcare portals, financial dashboards, or URLs with authentication tokens in query strings — those URLs will be synced to the cloud.
 
-### There is no undo
+**To avoid this entirely**, use `--output json`, `--output sqlite`, or `--output markdown`. These write only to local files on your disk.
+
+### There is no undo (GoodLinks mode)
 
 Saved items go to GoodLinks immediately. There is no batch undo — you would need to delete them one by one inside GoodLinks. **Always `--dry-run` first**, especially on large Tab Groups:
 
@@ -300,6 +378,8 @@ Saved items go to GoodLinks immediately. There is no batch undo — you would ne
 # Then save for real only after reviewing
 ./bin/stg2gl --group "Research"
 ```
+
+Local output modes (json, sqlite, markdown) are easier to undo — just delete the file or remove the last entries.
 
 ### Group name matching is partial
 
@@ -323,7 +403,7 @@ The `skip_url_prefixes` and `skip_url_regex` fields in `rules.json` control whic
 
 ### No data leaves your machine (except through GoodLinks)
 
-The tool itself makes no network calls — all processing is local. The only external data flow is through GoodLinks' own iCloud sync.
+The tool itself makes no network calls — all processing is local. The only external data flow is through GoodLinks' own iCloud sync, and only when using `--output goodlinks`.
 
 ### `--dry-run` output contains browsing history
 
@@ -334,3 +414,4 @@ If your terminal session is logged or recorded (e.g. iTerm2 session logs, `scrip
 - Safari Tab Groups are **not directly scriptable** in AppleScript. This tool uses macOS Accessibility GUI scripting to click the matching group in Safari's sidebar. This means `--mode select` requires Accessibility permission and may break if Apple changes Safari's sidebar UI in a future macOS update.
 - `--mode active` does **not** require Accessibility permission — it only reads tabs from the front window.
 - The `save_to_goodlinks.applescript` in `scripts/` is a standalone utility. You can use it independently: `osascript scripts/save_to_goodlinks.applescript "https://example.com" "tag1 tag2"`
+- **Similar tools:** [buku](https://github.com/jarun/buku) (CLI bookmark manager, SQLite-backed, local-first) and [nb](https://github.com/xwmx/nb) (CLI note/bookmark tool, Markdown + Git) take a local-first approach to bookmark storage. If you outgrow this tool's local output modes, either is a good next step.
