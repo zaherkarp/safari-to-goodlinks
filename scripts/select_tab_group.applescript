@@ -30,23 +30,25 @@ on run argv
 end run
 
 on findByTitleContains(uiObj, needleLower)
-	try
-		set t to value of attribute "AXTitle" of uiObj
-		if t is not missing value then
-			if my lower(t) contains needleLower then return uiObj
-		end if
-	end try
+	tell application "System Events"
+		try
+			set t to value of attribute "AXTitle" of uiObj
+			if t is not missing value then
+				if my lower(t) contains needleLower then return uiObj
+			end if
+		end try
 
-	try
-		set kids to UI elements of uiObj
-	on error
-		return missing value
-	end try
+		try
+			set kids to UI elements of uiObj
+		on error
+			return missing value
+		end try
 
-	repeat with k in kids
-		set hit to my findByTitleContains(k, needleLower)
-		if hit is not missing value then return hit
-	end repeat
+		repeat with k in kids
+			set hit to my findByTitleContains(k, needleLower)
+			if hit is not missing value then return hit
+		end repeat
+	end tell
 
 	return missing value
 end findByTitleContains
