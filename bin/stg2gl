@@ -127,9 +127,30 @@ print(cfg.get('throttle_ms', 50))
 " "$RULES_PATH")"
 THROTTLE="${THROTTLE:-$DEFAULT_THROTTLE}"
 
+# Wrapper: run osascript with a timeout (macOS has no `timeout` by default).
+# Kills the subprocess if it exceeds $1 seconds.
+run_osascript() {
+  local limit="$1"; shift
+  osascript "$@" &
+  local pid=$!
+  ( sleep "$limit" && kill "$pid" 2>/dev/null ) &
+  local watcher=$!
+  if wait "$pid" 2>/dev/null; then
+    kill "$watcher" 2>/dev/null; wait "$watcher" 2>/dev/null
+    return 0
+  else
+    kill "$watcher" 2>/dev/null; wait "$watcher" 2>/dev/null
+    return 1
+  fi
+}
+
 # Mode: optionally select group
 if [[ "$MODE" == "select" ]]; then
-  osascript "$REPO_DIR/scripts/select_tab_group.applescript" "$GROUP"
+  if ! run_osascript 15 "$REPO_DIR/scripts/select_tab_group.applescript" "$GROUP"; then
+    echo "Error: timed out or failed selecting tab group '$GROUP'" >&2
+    exit 1
+  fi
+  sleep 0.5  # give Safari a moment to switch
 fi
 
 # Export tabs JSON to stdout
