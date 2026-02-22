@@ -329,14 +329,14 @@ def flush_json(items_buffer, path):
 
 def save_sqlite(url, title, tags, db_conn):
     """Insert one row into the SQLite bookmarks table.
-    Returns True on success, error string on failure."""
+    Returns True on success, None for duplicate (already in DB), error string on failure."""
     try:
         cur = db_conn.execute(
             "INSERT OR IGNORE INTO bookmarks (url, title, tags, saved_at) VALUES (?, ?, ?, ?)",
             (url, title, " ".join(tags), datetime.now(timezone.utc).isoformat()),
         )
         if cur.rowcount == 0:
-            return "duplicate (already in database)"
+            return None  # already in DB from a previous run — not an error
         return True
     except Exception as e:
         return str(e)
@@ -436,6 +436,11 @@ for item in tabs:
 
         if save_result is True:
             record(url, title, "saved", "")
+        elif save_result is None:
+            # Already saved (e.g. SQLite cross-run duplicate) — treat as skip
+            record(url, title, "skipped", "duplicate (already in database)")
+            count_skipped += 1
+            continue
         else:
             record(url, title, "failed", save_result)
             count_failed += 1
@@ -444,13 +449,18 @@ for item in tabs:
     count_saved += 1
 
 # Flush local output backends
+flush_error = None
 if not dry_run:
-    if output == "json" and json_buffer:
-        flush_json(json_buffer, output_file)
-    elif output == "sqlite" and db_conn:
-        flush_sqlite(db_conn, output_file, count_saved)
-    elif output == "markdown" and md_buffer:
-        flush_markdown(md_buffer, output_file, group_name)
+    try:
+        if output == "json" and json_buffer:
+            flush_json(json_buffer, output_file)
+        elif output == "sqlite" and db_conn:
+            flush_sqlite(db_conn, output_file, count_saved)
+        elif output == "markdown" and md_buffer:
+            flush_markdown(md_buffer, output_file, group_name)
+    except Exception as e:
+        flush_error = str(e)
+        print(f"Error: failed to write output: {e}", file=sys.stderr)
 
 # ---------------------------------------------------------------------------
 # Verification report
@@ -489,7 +499,8 @@ if unsaveable:
     print("--- Unsaveable URLs (not saved anywhere) ---", file=sys.stderr)
     for u, t, d in unsaveable:
         label = t[:60] if t else "(no title)"
-        print(f"  {u}", file=sys.stderr)
+        url_display = u if u else "(empty)"
+        print(f"  {url_display}", file=sys.stderr)
         print(f"    {label}  [{d}]", file=sys.stderr)
 
 if failed_items:
@@ -497,15 +508,22 @@ if failed_items:
     print("--- Failed saves (attempted but did not succeed) ---", file=sys.stderr)
     for u, t, d in failed_items:
         label = t[:60] if t else "(no title)"
-        print(f"  {u}", file=sys.stderr)
+        url_display = u if u else "(empty)"
+        print(f"  {url_display}", file=sys.stderr)
         print(f"    {label}  [{d}]", file=sys.stderr)
 
 # Final status line (machine-parseable, preserves backwards compat)
-status = "OK" if count_failed == 0 else "PARTIAL_FAILURE"
+has_errors = count_failed > 0 or flush_error is not None
+status = "PARTIAL_FAILURE" if has_errors else "OK"
+if flush_error:
+    print("", file=sys.stderr)
+    print(f"--- Output write error ---", file=sys.stderr)
+    print(f"  {flush_error}", file=sys.stderr)
+    print(f"  {count_saved} item(s) may not have been persisted to disk.", file=sys.stderr)
 print("", file=sys.stderr)
 print(f"Done. total={count_total} saved={count_saved} skipped={count_skipped} failed={count_failed} status={status}", file=sys.stderr)
 
 # Exit 2 on partial failure so calling scripts can detect problems
-if count_failed > 0:
+if has_errors:
     sys.exit(2)
 PY
