@@ -28,6 +28,7 @@ on run argv
 			end try
 		end tell
 	end tell
+	return ""
 end run
 
 on findByTitleContains(uiObj, needle, depthLeft)
