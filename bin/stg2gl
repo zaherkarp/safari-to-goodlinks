@@ -169,6 +169,17 @@ mode         = os.environ["STG2GL_MODE"]
 output       = os.environ["STG2GL_OUTPUT"]
 output_file  = os.environ.get("STG2GL_OUTPUT_FILE", "")
 
+# ---------------------------------------------------------------------------
+# Verification: per-item result tracking
+# ---------------------------------------------------------------------------
+# Each item gets a result entry: (url, title, status, detail)
+# status is one of: "saved", "skipped", "failed"
+# detail explains why (e.g., "prefix:file:", "duplicate", "open returned 1")
+verify_results = []
+
+def record(url, title, status, detail=""):
+    verify_results.append((url, title, status, detail))
+
 max_n = int(max_arg) if max_arg else None
 
 cfg  = json.load(open(rules_path))
@@ -205,11 +216,16 @@ def norm_tag(t):
     return t.strip().lower().replace(" ", "-")
 
 def should_skip(url):
-    if not url or any(url.startswith(p) for p in skip_prefixes):
-        return True
+    """Check if a URL should be skipped.
+    Returns False if OK, or a string describing the skip reason."""
+    if not url:
+        return "empty URL"
+    for p in skip_prefixes:
+        if url.startswith(p):
+            return f"unsaveable URL (prefix: {p})"
     for rx in skip_regex:
         if rx.search(url):
-            return True
+            return f"blocked pattern ({rx.pattern})"
     return False
 
 def host_of(url):
@@ -258,14 +274,32 @@ def apply_rules(url, title, group_name):
 # Output backends
 # ---------------------------------------------------------------------------
 
+def check_goodlinks_available():
+    """Pre-flight: verify GoodLinks.app is installed and can handle its URL scheme."""
+    result = subprocess.run(
+        ["open", "-Ra", "GoodLinks"],
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        print(
+            "Error: GoodLinks.app not found. Install it or use --output json/sqlite/markdown.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
 def save_goodlinks(url, title, tags):
-    """Save via GoodLinks URL scheme (triggers iCloud sync)."""
+    """Save via GoodLinks URL scheme (triggers iCloud sync).
+    Returns True on success, error string on failure."""
     gl = "goodlinks://x-callback-url/save?quick=1&url={u}&tags={t}".format(
         u=urllib.parse.quote(url, safe=""),
         t=urllib.parse.quote(" ".join(tags), safe=""),
     )
-    subprocess.run(["open", gl], check=False)
+    result = subprocess.run(["open", gl], capture_output=True)
     time.sleep(throttle_ms / 1000.0)
+    if result.returncode != 0:
+        stderr_msg = result.stderr.decode("utf-8", errors="replace").strip()
+        return f"open exited {result.returncode}: {stderr_msg}" if stderr_msg else f"open exited {result.returncode}"
+    return True
 
 def save_json(url, title, tags, items_buffer):
     """Collect items into buffer; written to disk at end."""
@@ -294,11 +328,18 @@ def flush_json(items_buffer, path):
     print(f"Wrote {len(items_buffer)} items to {path} ({len(existing)} total)", file=sys.stderr)
 
 def save_sqlite(url, title, tags, db_conn):
-    """Insert one row into the SQLite bookmarks table."""
-    db_conn.execute(
-        "INSERT OR IGNORE INTO bookmarks (url, title, tags, saved_at) VALUES (?, ?, ?, ?)",
-        (url, title, " ".join(tags), datetime.now(timezone.utc).isoformat()),
-    )
+    """Insert one row into the SQLite bookmarks table.
+    Returns True on success, error string on failure."""
+    try:
+        cur = db_conn.execute(
+            "INSERT OR IGNORE INTO bookmarks (url, title, tags, saved_at) VALUES (?, ?, ?, ?)",
+            (url, title, " ".join(tags), datetime.now(timezone.utc).isoformat()),
+        )
+        if cur.rowcount == 0:
+            return "duplicate (already in database)"
+        return True
+    except Exception as e:
+        return str(e)
 
 def init_sqlite(path):
     """Open (or create) the SQLite database and return a connection."""
@@ -342,9 +383,14 @@ def flush_markdown(md_lines, path, group_name):
 seen_urls = set()
 count_saved = 0
 count_skipped = 0
+count_failed = 0
 count_total = 0
 
 group_name = group if mode == "select" else cfg.get("active_mode_group_name", "active")
+
+# Pre-flight: verify GoodLinks is available (unless dry-run or non-goodlinks output)
+if output == "goodlinks" and not dry_run:
+    check_goodlinks_available()
 
 # Initialize output backend state
 json_buffer = []
@@ -360,10 +406,13 @@ for item in tabs:
     title = item.get("title", "")
     count_total += 1
 
-    if should_skip(url):
+    skip_reason = should_skip(url)
+    if skip_reason:
+        record(url, title, "skipped", skip_reason)
         count_skipped += 1
         continue
     if dedupe and url in seen_urls:
+        record(url, title, "skipped", "duplicate")
         count_skipped += 1
         continue
     seen_urls.add(url)
@@ -373,15 +422,24 @@ for item in tabs:
     if dry_run:
         print(f"[DRY] {title[:80]!r} -> {url}")
         print(f"      tags: {' '.join(tags)}")
+        record(url, title, "saved", "dry-run")
     else:
+        save_result = True
         if output == "goodlinks":
-            save_goodlinks(url, title, tags)
+            save_result = save_goodlinks(url, title, tags)
         elif output == "json":
             save_json(url, title, tags, json_buffer)
         elif output == "sqlite":
-            save_sqlite(url, title, tags, db_conn)
+            save_result = save_sqlite(url, title, tags, db_conn)
         elif output == "markdown":
             save_markdown(url, title, tags, md_buffer)
+
+        if save_result is True:
+            record(url, title, "saved", "")
+        else:
+            record(url, title, "failed", save_result)
+            count_failed += 1
+            continue
 
     count_saved += 1
 
@@ -394,5 +452,60 @@ if not dry_run:
     elif output == "markdown" and md_buffer:
         flush_markdown(md_buffer, output_file, group_name)
 
-print(f"Done. total={count_total} saved={count_saved} skipped={count_skipped}", file=sys.stderr)
+# ---------------------------------------------------------------------------
+# Verification report
+# ---------------------------------------------------------------------------
+skipped_items = [(u, t, d) for u, t, s, d in verify_results if s == "skipped"]
+failed_items  = [(u, t, d) for u, t, s, d in verify_results if s == "failed"]
+
+print("", file=sys.stderr)
+print("=== Verification Report ===", file=sys.stderr)
+print(f"Safari tabs found:   {len(tabs)}", file=sys.stderr)
+if max_n is not None:
+    print(f"Limit (--max):       {max_n}", file=sys.stderr)
+print(f"Processed:           {count_total}", file=sys.stderr)
+print(f"  Saved:             {count_saved}", file=sys.stderr)
+print(f"  Skipped:           {count_skipped}", file=sys.stderr)
+if count_failed:
+    print(f"  Failed:            {count_failed}", file=sys.stderr)
+print(f"Output:              {output}" + (f" ({output_file})" if output_file else ""), file=sys.stderr)
+
+# Break down skipped items by reason category
+if skipped_items:
+    skip_reasons = {}
+    for u, t, d in skipped_items:
+        # Group by the first word of the reason for the summary
+        category = d.split(" (")[0] if " (" in d else d
+        skip_reasons.setdefault(category, []).append((u, t, d))
+    print("", file=sys.stderr)
+    print("--- Skipped breakdown ---", file=sys.stderr)
+    for category, items in skip_reasons.items():
+        print(f"  {category}: {len(items)}", file=sys.stderr)
+
+# List individual unsaveable/failed items (most useful part of verification)
+unsaveable = [(u, t, d) for u, t, d in skipped_items if d.startswith("unsaveable") or d == "empty URL"]
+if unsaveable:
+    print("", file=sys.stderr)
+    print("--- Unsaveable URLs (not saved anywhere) ---", file=sys.stderr)
+    for u, t, d in unsaveable:
+        label = t[:60] if t else "(no title)"
+        print(f"  {u}", file=sys.stderr)
+        print(f"    {label}  [{d}]", file=sys.stderr)
+
+if failed_items:
+    print("", file=sys.stderr)
+    print("--- Failed saves (attempted but did not succeed) ---", file=sys.stderr)
+    for u, t, d in failed_items:
+        label = t[:60] if t else "(no title)"
+        print(f"  {u}", file=sys.stderr)
+        print(f"    {label}  [{d}]", file=sys.stderr)
+
+# Final status line (machine-parseable, preserves backwards compat)
+status = "OK" if count_failed == 0 else "PARTIAL_FAILURE"
+print("", file=sys.stderr)
+print(f"Done. total={count_total} saved={count_saved} skipped={count_skipped} failed={count_failed} status={status}", file=sys.stderr)
+
+# Exit 2 on partial failure so calling scripts can detect problems
+if count_failed > 0:
+    sys.exit(2)
 PY
