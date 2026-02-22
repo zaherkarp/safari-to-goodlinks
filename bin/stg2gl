@@ -184,6 +184,9 @@ max_n = int(max_arg) if max_arg else None
 
 cfg  = json.load(open(rules_path))
 tabs = json.loads(os.environ["STG2GL_TABS_JSON"])
+if not isinstance(tabs, list):
+    print(f"Error: expected tab list from Safari, got {type(tabs).__name__}", file=sys.stderr)
+    sys.exit(1)
 base_tags = json.loads(os.environ["STG2GL_BASE_TAGS_JSON"])
 
 skip_prefixes = tuple(cfg.get("skip_url_prefixes", []))
@@ -206,11 +209,14 @@ group_tag_template = cfg.get("group_tag_format", "tg/{group}")
 # Pre-compile and validate keyword_tags regexes
 compiled_keyword_tags = []
 for rule in keyword_tags:
+    if "tags" not in rule:
+        print(f"Warning: keyword_tags rule missing 'tags' key, skipping: {rule!r}", file=sys.stderr)
+        continue
     try:
         pat = re.compile(rule["pattern"], re.I)
         compiled_keyword_tags.append((pat, rule))
-    except re.error as e:
-        print(f"Warning: invalid keyword_tags pattern {rule.get('pattern', '?')!r}: {e}", file=sys.stderr)
+    except (re.error, KeyError) as e:
+        print(f"Warning: invalid keyword_tags rule {rule.get('pattern', '?')!r}: {e}", file=sys.stderr)
 
 def norm_tag(t):
     return t.strip().lower().replace(" ", "-")
@@ -362,10 +368,20 @@ def flush_sqlite(db_conn, path, count):
     db_conn.close()
     print(f"Wrote {count} items to {path}", file=sys.stderr)
 
+def _md_escape_link_text(s):
+    """Escape characters that break markdown link text: [ ] and newlines."""
+    return s.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]").replace("\n", " ")
+
+def _md_escape_url(s):
+    """Escape characters that break markdown link URLs: ( ) and newlines."""
+    return s.replace("(", "%28").replace(")", "%29").replace("\n", "")
+
 def save_markdown(url, title, tags, md_lines):
     """Collect Markdown lines into buffer; written to disk at end."""
     tag_str = " ".join(f"`{t}`" for t in tags)
-    md_lines.append(f"- [{title}]({url}) {tag_str}")
+    safe_title = _md_escape_link_text(title)
+    safe_url = _md_escape_url(url)
+    md_lines.append(f"- [{safe_title}]({safe_url}) {tag_str}")
 
 def flush_markdown(md_lines, path, group_name):
     """Append a dated section to a Markdown file."""
@@ -397,13 +413,17 @@ json_buffer = []
 md_buffer = []
 db_conn = None
 if output == "sqlite" and not dry_run:
-    db_conn = init_sqlite(output_file)
+    try:
+        db_conn = init_sqlite(output_file)
+    except Exception as e:
+        print(f"Error: cannot open SQLite database {output_file!r}: {e}", file=sys.stderr)
+        sys.exit(1)
 
 for item in tabs:
     if max_n is not None and count_total >= max_n:
         break
-    url = item.get("url", "")
-    title = item.get("title", "")
+    url = str(item.get("url", "") or "")
+    title = str(item.get("title", "") or "")
     count_total += 1
 
     skip_reason = should_skip(url)
