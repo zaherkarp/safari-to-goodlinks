@@ -146,7 +146,7 @@ run_osascript() {
 
 # Mode: optionally select group
 if [[ "$MODE" == "select" ]]; then
-  if ! run_osascript 15 "$REPO_DIR/scripts/select_tab_group.applescript" "$GROUP"; then
+  if ! run_osascript 30 "$REPO_DIR/scripts/select_tab_group.applescript" "$GROUP"; then
     echo "Error: timed out or failed selecting tab group '$GROUP'" >&2
     exit 1
   fi
